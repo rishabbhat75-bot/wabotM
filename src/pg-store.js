@@ -3,10 +3,18 @@ const { initAuthCreds, BufferJSON, proto } = pkg;
 import pg from 'pg';
 
 export const usePostgresAuthState = async (dbUrl) => {
+    // 🔴 CRITICAL FIX FOR RENDER: Supabase poolers often default to IPv6, which Render free tier blocks (ENETUNREACH)
+    // We automatically intercept the connection string and force the official Supabase IPv4 proxy
+    if (dbUrl.includes('.pooler.supabase.com') && !dbUrl.includes('.ipv4.')) {
+        dbUrl = dbUrl.replace('.pooler.supabase.com', '.ipv4.pooler.supabase.com');
+        console.log('🔧 Auto-patched Supabase URL to use IPv4 Pooler to prevent Render Network crashes.');
+    }
+
     // We use a pool directly and keep it open
     const pool = new pg.Pool({
         connectionString: dbUrl,
-        ssl: { rejectUnauthorized: false } // Required for Supabase/Neon
+        ssl: { rejectUnauthorized: false }, // Required for Supabase/Neon
+        host: dbUrl.includes('supabase') ? undefined : undefined // Force standard host parsing
     });
 
     // Create table if it doesn't exist
