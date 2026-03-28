@@ -56,7 +56,6 @@ export const usePostgresAuthState = async (dbUrl) => {
             data JSONB
         )
     `);
-    await pool.query('TRUNCATE TABLE baileys_auth');
 
     // Helper to format keys correctly
     const fixFileName = (file) => file?.replace(/\//g, '__')?.replace(/:/g, '-');
@@ -114,15 +113,22 @@ export const usePostgresAuthState = async (dbUrl) => {
             return data;
         },
         set: async (data) => {
-            const tasks = [];
+            const fns = [];
             for (const category in data) {
                 for (const id in data[category]) {
                     const value = data[category][id];
                     const file = `${category}-${id}.json`;
-                    tasks.push(value ? writeData(value, file) : removeData(file));
+                    fns.push(async () => {
+                        if (value) await writeData(value, file);
+                        else await removeData(file);
+                    });
                 }
             }
-            await Promise.all(tasks);
+            // Execute in chunks of 50 to prevent DB connection pool exhaustion (Neon timeout)
+            const CHUNK_SIZE = 50;
+            for (let i = 0; i < fns.length; i += CHUNK_SIZE) {
+                await Promise.all(fns.slice(i, i + CHUNK_SIZE).map(f => f()));
+            }
         }
     };
 
