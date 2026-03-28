@@ -160,35 +160,3 @@ export async function quickGenerate(prompt, modelName) {
 
 export { config };
 
-/**
- * Generate an image using the user provided API key for gemini-2.5-flash-image
- */
-export async function generateImageGemini(prompt) {
-    const imageApiKey = process.env.GEMINI_IMAGE_KEY || apiKeys[0];
-    if (!imageApiKey) throw new Error('No Gemini API key available for image generation.');
-    const genAI = new GoogleGenerativeAI(imageApiKey);
-    
-    for (let i = 0; i < 3; i++) {
-        try {
-            const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-image' });
-            const result = await model.generateContent(prompt);
-            
-            const parts = result.response?.candidates?.[0]?.content?.parts || [];
-            for (const p of parts) {
-                if (p.inlineData && p.inlineData.data) {
-                    return Buffer.from(p.inlineData.data, 'base64');
-                }
-            }
-            throw new Error('No valid image data generated in response.');
-        } catch (error) {
-            console.error('Image Gen attempt failed:', error.message);
-            if (error.message.includes('retry') || error.message.includes('429')) {
-                console.log('Image API rate limited... waiting 10s to retry...');
-                await new Promise(r => setTimeout(r, 10000));
-                continue;
-            }
-            throw error;
-        }
-    }
-    throw new Error('Image generation failed due to strict strict rate limits or errors.');
-}
