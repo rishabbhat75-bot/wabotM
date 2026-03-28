@@ -116,31 +116,3 @@ export async function* streamGenerateNvidia(prompt, modelName, systemInstruction
     }
 }
 
-/**
- * Generate an image from an NVIDIA model via OpenAI format endpoint
- * @param {string} prompt - The image prompt
- * @param {string} modelName - e.g. 'stabilityai/stable-diffusion-3-medium'
- * @returns {Buffer} - The decoded image buffer
- */
-export async function generateImageNvidia(prompt, modelName) {
-    if (!client) {
-        throw new Error('No NVIDIA API key configured.');
-    }
-
-    try {
-        const response = await client.images.generate({
-            prompt: prompt,
-            model: modelName,
-            response_format: 'b64_json',
-        });
-
-        // The b64_json is correctly mapped in NVIDIA's response under data[0].b64_json
-        const base64Img = response.data?.[0]?.b64_json;
-        if (!base64Img) throw new Error('Model returned an empty image');
-
-        return Buffer.from(base64Img, 'base64');
-    } catch (err) {
-        const errObj = err.error || err;
-        throw new Error(`NVIDIA Image Gen Failed (${modelName}): ${errObj.message || errObj}`);
-    }
-}
