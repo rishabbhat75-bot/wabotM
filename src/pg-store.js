@@ -1,5 +1,4 @@
-import pkg from '@whiskeysockets/baileys';
-const { initAuthCreds, BufferJSON, proto } = pkg;
+import { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/baileys';
 import pg from 'pg';
 
 export const usePostgresAuthState = async (dbUrl) => {
