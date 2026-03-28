@@ -1,4 +1,4 @@
-import { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/baileys';
+import { initAuthCreds, BufferJSON, proto, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import pg from 'pg';
 
 export const usePostgresAuthState = async (dbUrl) => {
@@ -98,35 +98,37 @@ export const usePostgresAuthState = async (dbUrl) => {
 
     const creds = (await readData('creds.json')) || initAuthCreds();
 
+    const baseKeyStore = {
+        get: async (type, ids) => {
+            const data = {};
+            await Promise.all(
+                ids.map(async (id) => {
+                    let value = await readData(`${type}-${id}.json`);
+                    if (type === 'app-state-sync-key' && value) {
+                        value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                    }
+                    data[id] = value;
+                })
+            );
+            return data;
+        },
+        set: async (data) => {
+            const tasks = [];
+            for (const category in data) {
+                for (const id in data[category]) {
+                    const value = data[category][id];
+                    const file = `${category}-${id}.json`;
+                    tasks.push(value ? writeData(value, file) : removeData(file));
+                }
+            }
+            await Promise.all(tasks);
+        }
+    };
+
     return {
         state: {
             creds,
-            keys: {
-                get: async (type, ids) => {
-                    const data = {};
-                    await Promise.all(
-                        ids.map(async (id) => {
-                            let value = await readData(`${type}-${id}.json`);
-                            if (type === 'app-state-sync-key' && value) {
-                                value = proto.Message.AppStateSyncKeyData.fromObject(value);
-                            }
-                            data[id] = value;
-                        })
-                    );
-                    return data;
-                },
-                set: async (data) => {
-                    const tasks = [];
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const file = `${category}-${id}.json`;
-                            tasks.push(value ? writeData(value, file) : removeData(file));
-                        }
-                    }
-                    await Promise.all(tasks);
-                }
-            }
+            keys: makeCacheableSignalKeyStore(baseKeyStore)
         },
         saveCreds: async () => {
             return writeData(creds, 'creds.json');
