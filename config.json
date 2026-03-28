@@ -1,0 +1,37 @@
+{
+  "apiKeys": [],
+  "nvidiaKey": "",
+  "models": {
+    "classifier": {
+      "provider": "gemini",
+      "name": "gemini-2.5-flash"
+    },
+    "tier1": [
+      {
+        "provider": "gemini",
+        "name": "gemini-2.5-flash"
+      }
+    ],
+    "tier2": [
+      {
+        "provider": "nvidia",
+        "name": "meta/llama-3.3-70b-instruct"
+      }
+    ],
+    "tier3": [
+      {
+        "provider": "nvidia",
+        "name": "meta/llama-3.1-405b-instruct"
+      },
+      {
+        "provider": "nvidia",
+        "name": "qwen/qwen3.5-397b-a17b"
+      }
+    ]
+  },
+  "commandPrefix": ".ask",
+  "streaming": {
+    "editIntervalMs": 600,
+    "minChunkLength": 8
+  }
+}

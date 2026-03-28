@@ -1,0 +1,22 @@
+{
+  "name": "whbot",
+  "version": "1.0.0",
+  "description": "WhatsApp AI Bot powered by Gemini API via Baileys",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^5.2.1",
+    "googlethis": "^1.8.0",
+    "openai": "^6.33.0",
+    "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.18.0",
+    "pg": "^8.20.0",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
