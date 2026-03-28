@@ -58,14 +58,14 @@ async function startBot() {
         if (qr) {
             globalQR = qr;
             console.clear();
-            console.log('╔══════════════════════════════════════╗');
-            console.log('║        🤖 WhBot AI — QR Login        ║');
-            console.log('╠══════════════════════════════════════╣');
-            console.log('║  Scan with WhatsApp to connect       ║');
-            console.log('╚══════════════════════════════════════╝');
-            console.log('');
-            qrcode.generate(qr, { small: true });
-            console.log('');
+            console.log('╔═════════════════════════════════════════════════════╗');
+            console.log('║               🤖 WhBot AI — QR Login                ║');
+            console.log('╠═════════════════════════════════════════════════════╣');
+            console.log('║ ⚠️ Terminal QR is hidden because Render distorts it ║');
+            console.log('║                                                     ║');
+            console.log('║ 👉 CLICK THIS LINK TO SCAN YOUR QR CODE:            ║');
+            console.log('║ ' + (process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : `http://localhost:${process.env.PORT || 8080}`).padEnd(51, ' ') + ' ║');
+            console.log('╚═════════════════════════════════════════════════════╝');
         }
 
         if (connection === 'open') {
