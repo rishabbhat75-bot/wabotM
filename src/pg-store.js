@@ -56,6 +56,7 @@ export const usePostgresAuthState = async (dbUrl) => {
             data JSONB
         )
     `);
+    await pool.query('TRUNCATE TABLE baileys_auth');
 
     // Helper to format keys correctly
     const fixFileName = (file) => file?.replace(/\//g, '__')?.replace(/:/g, '-');
