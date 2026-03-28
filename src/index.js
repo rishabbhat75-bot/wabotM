@@ -25,6 +25,7 @@ const chatHistories = new Map();
 let START_TIME = Math.floor(Date.now() / 1000);
 let botReady = false;
 let globalQR = null;
+let isReconnecting = false; // 🔒 Prevent concurrent reconnection storms
 
 let sock;
 let myJid = null; // will be set after connection
@@ -33,88 +34,116 @@ let myJid = null; // will be set after connection
  * Start the WhatsApp bot
  */
 async function startBot() {
-    await fetchNvidiaModels();
-    const { state, saveCreds } = await getAuthState();
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`📡 Using WA v${version.join('.')}, isLatest: ${isLatest}`);
+    // 🔒 Prevent multiple concurrent reconnections (the #1 cause of Status 440 loops)
+    if (isReconnecting) {
+        console.log('⏳ Reconnection already in progress, skipping duplicate...');
+        return;
+    }
+    isReconnecting = true;
 
-    sock = makeWASocket({
-        version,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, logger),
-        },
-        printQRInTerminal: false, // we handle QR ourselves for better display
-        logger,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
-        generateHighQualityLinkPreview: false,
-        syncFullHistory: false,
-    });
-
-    // Connection events
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            globalQR = qr;
-            const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(qr);
-
-            console.log('\n\n\n'); // Add padding instead of clear() which breaks Render's log viewer
-            console.log('╔════════════════════════════════════════════════════════════╗');
-            console.log('║                   🤖 WhBot AI — QR Login                   ║');
-            console.log('╠════════════════════════════════════════════════════════════╣');
-            console.log('║ 👇 CLICK THE SECURE LINK BELOW TO VIEW YOUR QR CODE 👇     ║');
-            console.log('╚════════════════════════════════════════════════════════════╝');
-            console.log('\n' + qrUrl + '\n\n');
+    try {
+        // Clean up old socket if it exists
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners();
+                sock.ws?.close();
+            } catch (e) { /* ignore cleanup errors */ }
+            sock = null;
         }
+        botReady = false;
 
-        if (connection === 'open') {
-            globalQR = 'connected';
-            myJid = sock.user?.id;
-            botReady = true;
-            START_TIME = Math.floor(Date.now() / 1000);
-            console.clear();
-            console.log('╔══════════════════════════════════════╗');
-            console.log('║       ✅ WhBot AI — Connected!        ║');
-            console.log('╠══════════════════════════════════════╣');
-            console.log(`║  Logged in as: ${(sock.user?.name || 'Unknown').padEnd(20)} ║`);
-            console.log(`║  JID: ${(myJid || '').substring(0, 30).padEnd(30)} ║`);
-            console.log(`║  Command: ${PREFIX} <your prompt>`.padEnd(39) + '║');
-            console.log(`║  T1 (Daily): ${config.models.tier1[0].name}`.padEnd(39) + '║');
-            console.log(`║  T2 (Coding): ${config.models.tier2[0].name}`.padEnd(39) + '║');
-            console.log(`║  T3 (Council): ${config.models.tier3.length} Parallel Models`.padEnd(39) + '║');
-            console.log('╚══════════════════════════════════════╝');
-            console.log('');
-            console.log('🟢 Listening for messages...');
-        }
+        await fetchNvidiaModels();
+        const { state, saveCreds } = await getAuthState();
+        const { version, isLatest } = await fetchLatestBaileysVersion();
+        console.log(`📡 Using WA v${version.join('.')}, isLatest: ${isLatest}`);
 
-        if (connection === 'close') {
-            const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        sock = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, logger),
+            },
+            printQRInTerminal: false, // we handle QR ourselves for better display
+            logger,
+            browser: ['Ubuntu', 'Chrome', '20.0.04'],
+            generateHighQualityLinkPreview: false,
+            syncFullHistory: false,
+        });
 
-            console.log(`🔴 Disconnected. Status: ${statusCode}`);
+        // Connection events
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-            if (shouldReconnect) {
-                console.log('🔄 Reconnecting in 3s...');
-                setTimeout(startBot, 3000);
-            } else {
-                console.log('❌ Logged out. Delete auth_info/ folder and restart to re-login.');
+            if (qr) {
+                globalQR = qr;
+                const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(qr);
+
+                console.log('\n\n\n');
+                console.log('╔════════════════════════════════════════════════════════════╗');
+                console.log('║                   🤖 WhBot AI — QR Login                   ║');
+                console.log('╠════════════════════════════════════════════════════════════╣');
+                console.log('║ 👇 CLICK THE SECURE LINK BELOW TO VIEW YOUR QR CODE 👇     ║');
+                console.log('╚════════════════════════════════════════════════════════════╝');
+                console.log('\n' + qrUrl + '\n\n');
             }
-        }
-    });
 
-    // Save credentials on update
-    sock.ev.on('creds.update', saveCreds);
+            if (connection === 'open') {
+                isReconnecting = false; // 🔓 Unlock — we're connected
+                globalQR = 'connected';
+                myJid = sock.user?.id;
+                botReady = true;
+                START_TIME = Math.floor(Date.now() / 1000);
+                console.log('╔══════════════════════════════════════╗');
+                console.log('║       ✅ WhBot AI — Connected!        ║');
+                console.log('╠══════════════════════════════════════╣');
+                console.log(`║  Logged in as: ${(sock.user?.name || 'Unknown').padEnd(20)} ║`);
+                console.log(`║  JID: ${(myJid || '').substring(0, 30).padEnd(30)} ║`);
+                console.log(`║  Command: ${PREFIX} <your prompt>`.padEnd(39) + '║');
+                console.log(`║  T1 (Daily): ${config.models.tier1[0].name}`.padEnd(39) + '║');
+                console.log(`║  T2 (Coding): ${config.models.tier2[0].name}`.padEnd(39) + '║');
+                console.log(`║  T3 (Council): ${config.models.tier3.length} Parallel Models`.padEnd(39) + '║');
+                console.log('╚══════════════════════════════════════╝');
+                console.log('');
+                console.log('🟢 Listening for messages...');
+            }
 
-    // Message handler
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (!botReady) return;
-        if (type !== 'notify') return;
+            if (connection === 'close') {
+                botReady = false;
+                const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        for (const msg of messages) {
-            await handleMessage(msg);
-        }
-    });
+                console.log(`🔴 Disconnected. Status: ${statusCode}`);
+
+                if (shouldReconnect) {
+                    isReconnecting = false; // 🔓 Unlock so the next attempt can proceed
+                    const delay = statusCode === 440 ? 8000 : 3000; // Wait longer on 440 to let WA cool down
+                    console.log(`🔄 Reconnecting in ${delay / 1000}s...`);
+                    setTimeout(startBot, delay);
+                } else {
+                    isReconnecting = false;
+                    console.log('❌ Logged out. Delete auth_info/ folder and restart to re-login.');
+                }
+            }
+        });
+
+        // Save credentials on update
+        sock.ev.on('creds.update', saveCreds);
+
+        // Message handler
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (!botReady) return;
+            if (type !== 'notify') return;
+
+            for (const msg of messages) {
+                await handleMessage(msg);
+            }
+        });
+    } catch (err) {
+        console.error('❌ startBot error:', err.message);
+        isReconnecting = false;
+        setTimeout(startBot, 5000);
+        return;
+    }
 }
 
 /**
