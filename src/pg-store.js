@@ -3,18 +3,51 @@ const { initAuthCreds, BufferJSON, proto } = pkg;
 import pg from 'pg';
 
 export const usePostgresAuthState = async (dbUrl) => {
-    // 🔴 CRITICAL FIX FOR RENDER: Supabase poolers often default to IPv6, which Render free tier blocks (ENETUNREACH)
-    // We automatically intercept the connection string and force the official Supabase IPv4 proxy
-    if (dbUrl.includes('.pooler.supabase.com') && !dbUrl.includes('.ipv4.')) {
-        dbUrl = dbUrl.replace('.pooler.supabase.com', '.ipv4.pooler.supabase.com');
-        console.log('🔧 Auto-patched Supabase URL to use IPv4 Pooler to prevent Render Network crashes.');
+    // =========================================================================
+    // 🔴 CRITICAL FIX FOR RENDER.COM FREE TIER
+    // =========================================================================
+    // Render free tier does NOT support IPv6 outbound connections.
+    // Supabase direct connections (*.supabase.co) are IPv6-ONLY — no IPv4 at all.
+    // Supabase pooler connections (*.pooler.supabase.com) also default to IPv6.
+    // The ONLY way to connect from Render is through the IPv4 pooler endpoint.
+    //
+    // This code auto-detects ANY Supabase URL pattern and rewrites it to use
+    // the IPv4-compatible Supavisor pooler with session mode (port 5432).
+    // =========================================================================
+
+    const originalUrl = dbUrl;
+
+    try {
+        const parsedUrl = new URL(dbUrl);
+
+        if (parsedUrl.hostname.includes('supabase')) {
+            // Case 1: Direct connection (e.g., aws-0-ap-south-1.supabase.co)
+            // These are IPv6-ONLY. Must convert to pooler.
+            if (!parsedUrl.hostname.includes('pooler.supabase.com')) {
+                // Extract the region part: "aws-0-ap-south-1" from "aws-0-ap-south-1.supabase.co"
+                const region = parsedUrl.hostname.split('.supabase')[0];
+                parsedUrl.hostname = `${region}.pooler.supabase.com`;
+                parsedUrl.port = '5432'; // Session mode for long-lived connections
+                console.log(`🔧 Converted Supabase DIRECT connection to POOLER (Session mode).`);
+            }
+
+            // Case 2: Already a pooler URL but missing .ipv4. prefix
+            if (parsedUrl.hostname.includes('.pooler.supabase.com') && !parsedUrl.hostname.includes('.ipv4.')) {
+                parsedUrl.hostname = parsedUrl.hostname.replace('.pooler.supabase.com', '.ipv4.pooler.supabase.com');
+                console.log(`🔧 Added IPv4 prefix to Supabase pooler URL.`);
+            }
+
+            dbUrl = parsedUrl.toString();
+            console.log(`✅ Final Database URL: ${dbUrl.replace(/:[^:@]+@/, ':****@')}`); // Log with password hidden
+        }
+    } catch (e) {
+        console.warn('⚠️ Could not parse DATABASE_URL for Supabase auto-fix. Using as-is.');
     }
 
     // We use a pool directly and keep it open
     const pool = new pg.Pool({
         connectionString: dbUrl,
-        ssl: { rejectUnauthorized: false }, // Required for Supabase/Neon
-        host: dbUrl.includes('supabase') ? undefined : undefined // Force standard host parsing
+        ssl: { rejectUnauthorized: false } // Required for Supabase/Neon
     });
 
     // Create table if it doesn't exist
