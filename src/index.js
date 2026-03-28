@@ -24,6 +24,7 @@ const chatHistories = new Map();
 
 let START_TIME = Math.floor(Date.now() / 1000);
 let botReady = false;
+let globalQR = null;
 
 let sock;
 let myJid = null; // will be set after connection
@@ -55,6 +56,7 @@ async function startBot() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
+            globalQR = qr;
             console.clear();
             console.log('╔══════════════════════════════════════╗');
             console.log('║        🤖 WhBot AI — QR Login        ║');
@@ -67,6 +69,7 @@ async function startBot() {
         }
 
         if (connection === 'open') {
+            globalQR = 'connected';
             myJid = sock.user?.id;
             botReady = true;
             START_TIME = Math.floor(Date.now() / 1000);
@@ -518,14 +521,27 @@ process.on('uncaughtException', (err) => {
 
 // Start Express Server for Render health checks and UptimeRobot pinging
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 app.get('/', (req, res) => {
-    res.send('🤖 WhBot is running!');
+    if (globalQR && globalQR !== 'connected') {
+        const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?data=' + encodeURIComponent(globalQR) + '&size=300x300';
+        res.send(`
+            <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
+                <h2>📱 Scan to Login to WhBot</h2>
+                <img src="${qrUrl}" alt="WhatsApp QR Code" style="border: 1px solid #ccc; padding: 10px; border-radius: 10px;" />
+                <p style="color: #666; margin-top: 20px;">Refresh this page if the QR code expires.</p>
+            </div>
+        `);
+    } else if (globalQR === 'connected') {
+        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px; color: green;">✅ WhBot is Connected and Running!</h2>');
+    } else {
+        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px;">🤖 WhBot is starting, please wait...</h2>');
+    }
 });
 
 app.listen(PORT, () => {
-    console.log(`🌐 Health check server running on port ${PORT}`);
+    console.log(`🌐 Web UI server running on port ${PORT}`);
 });
 
 // Start WhatsApp Bot
