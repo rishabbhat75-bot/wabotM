@@ -57,15 +57,15 @@ async function startBot() {
 
         if (qr) {
             globalQR = qr;
-            console.clear();
-            console.log('╔═════════════════════════════════════════════════════╗');
-            console.log('║               🤖 WhBot AI — QR Login                ║');
-            console.log('╠═════════════════════════════════════════════════════╣');
-            console.log('║ ⚠️ Terminal QR is hidden because Render distorts it ║');
-            console.log('║                                                     ║');
-            console.log('║ 👉 CLICK THIS LINK TO SCAN YOUR QR CODE:            ║');
-            console.log('║ ' + (process.env.RENDER_EXTERNAL_HOSTNAME ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : `http://localhost:${process.env.PORT || 8080}`).padEnd(51, ' ') + ' ║');
-            console.log('╚═════════════════════════════════════════════════════╝');
+            const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(qr);
+
+            console.log('\n\n\n'); // Add padding instead of clear() which breaks Render's log viewer
+            console.log('╔════════════════════════════════════════════════════════════╗');
+            console.log('║                   🤖 WhBot AI — QR Login                   ║');
+            console.log('╠════════════════════════════════════════════════════════════╣');
+            console.log('║ 👇 CLICK THE SECURE LINK BELOW TO VIEW YOUR QR CODE 👇     ║');
+            console.log('╚════════════════════════════════════════════════════════════╝');
+            console.log('\n' + qrUrl + '\n\n');
         }
 
         if (connection === 'open') {
