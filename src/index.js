@@ -8,6 +8,7 @@ import { getAuthState } from './store.js';
 import { streamGenerate, config } from './gemini.js';
 import { selectModel, analyzeIntent } from './router.js';
 import { fetchNvidiaModels, streamGenerateNvidia, fuzzyMatchModel, availableModels } from './nvidia.js';
+import { runCouncil } from './council.js';
 import { formatForWhatsApp, streamingIndicator, finalFormat } from './formatter.js';
 import qrcode from 'qrcode-terminal';
 import express from 'express';
@@ -215,6 +216,7 @@ async function handleMessage(msg) {
                 `*Core Chat:*\n` +
                 `• \`.ask <msg>\` - Talk to the AI router\n` +
                 `• \`.ask "model" <msg>\` - Force a specific model\n` +
+                `• \`.council <msg>\` - Deploy the 9-Member AI Council\n` +
                 `• \`.model\` - List all available models\n\n` +
                 `*Tools:*\n` +
                 `• \`.search <query>\` - Perform a live Google search\n` +
@@ -263,11 +265,16 @@ async function handleMessage(msg) {
         let isSelect = false;
         let forcedModelName = '';
         let requiresSearch = false;
+        let isCouncil = false;
 
         // Check for .search prefix
         if (text.startsWith('.search ')) {
             prompt = text.substring(8).trim();
             requiresSearch = true;
+        }
+        else if (text.startsWith('.council ') || text.trim() === '.council') {
+            prompt = text.startsWith('.council ') ? text.substring(9).trim() : '';
+            isCouncil = true;
         }
         // Check for .ask prefix
         else if (text.startsWith(PREFIX + ' ') || text.startsWith(PREFIX + '"')) {
@@ -284,11 +291,11 @@ async function handleMessage(msg) {
         // If it's a captioned image/PDF but doesn't have .ask matching, allow it to process the text if there is text.
         else if ((isImage || isDoc) && text.trim().length > 0) {
             prompt = text.trim();
-        } else {
+        } else if (!isCouncil) {
             return;
         }
 
-        if (!prompt) return;
+        if (!prompt && !isCouncil) return;
 
         const chatJid = msg.key.remoteJid;
 
@@ -398,6 +405,26 @@ Avoid walls of text. Provide absolute maximum intelligence, logic, and structure
 
         // ONE unified message for the frontend
         const sentMsg = await sock.sendMessage(chatJid, { text: `💭 _Analyzing..._` }, { quoted: msg });
+
+        if (isCouncil) {
+            try {
+                const result = await runCouncil(fullPrompt, imageBase64, async (statusMsg) => {
+                    try {
+                        await sock.sendMessage(chatJid, { text: statusMsg, edit: sentMsg.key });
+                    } catch (e) {} // Ignore fast edit limit errors
+                });
+                
+                history.push({ role: 'model', parts: [{ text: result.text }] });
+                await postProcessAndSend(result.text, sentMsg.key);
+            } catch (error) {
+                console.error('Council error:', error);
+                await sock.sendMessage(chatJid, { 
+                    text: `❌ _Council Execution Failed:_\n\n${error.message}`, 
+                    edit: sentMsg.key 
+                });
+            }
+            return; // Done
+        }
 
         if (isImageIntent) {
             await sock.sendMessage(chatJid, { text: `🎨 _Generating your image..._` }, { edit: sentMsg.key });
