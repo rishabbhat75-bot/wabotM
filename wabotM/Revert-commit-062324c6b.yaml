@@ -1,0 +1,3 @@
+# Revert "Implement AI Council orchestration in council.js"
+
+This reverts commit 062324c6b034c78db57b142d9070729388b6b970.
