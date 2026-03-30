@@ -10,53 +10,108 @@ import { selectModel, analyzeIntent } from './router.js';
 import { fetchNvidiaModels, streamGenerateNvidia, fuzzyMatchModel, availableModels } from './nvidia.js';
 import { runCouncil } from './council.js';
 import { formatForWhatsApp, streamingIndicator, finalFormat } from './formatter.js';
-import qrcode from 'qrcode-terminal';
 import express from 'express';
 import { parsePdfBuffer, createPdfBuffer, uploadToPastebin, googleSearch } from './tools.js';
 
-const logger = pino({ level: 'silent' }); // suppress Baileys verbose logs
+const logger = pino({ level: 'silent' });
 
 const PREFIX = config.commandPrefix || '.ask';
 const EDIT_INTERVAL = config.streaming?.editIntervalMs || 600;
 const MIN_CHUNK = config.streaming?.minChunkLength || 8;
-const MAX_HISTORY_LENGTH = 20; // Keep track of the last 20 messages (10 turns) per chat
+const MAX_HISTORY_LENGTH = 20;
+const MESSAGE_CACHE_TTL = 10 * 60 * 1000;
+const MAX_TRACKED_MESSAGES = 500;
 
 const chatHistories = new Map();
+const processedMessages = new Map();
+const botMessageIds = new Map();
 
 let START_TIME = Math.floor(Date.now() / 1000);
 let botReady = false;
 let globalQR = null;
-let isReconnecting = false; // 🔒 Prevent concurrent reconnection storms
+let isReconnecting = false;
 let shuttingDown = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 
 let sock;
-let myJid = null; // will be set after connection
+let myJid = null;
 
-/**
- * Start the WhatsApp bot
- */
+function pruneMessageMap(map) {
+    const now = Date.now();
+    for (const [id, ts] of map.entries()) {
+        if (now - ts > MESSAGE_CACHE_TTL) {
+            map.delete(id);
+        }
+    }
+    while (map.size > MAX_TRACKED_MESSAGES) {
+        const oldestKey = map.keys().next().value;
+        if (!oldestKey) break;
+        map.delete(oldestKey);
+    }
+}
+
+function rememberMessage(map, messageId) {
+    if (!messageId) return;
+    pruneMessageMap(map);
+    map.set(messageId, Date.now());
+}
+
+function hasRecentMessage(map, messageId) {
+    if (!messageId) return false;
+    pruneMessageMap(map);
+    return map.has(messageId);
+}
+
+function getMessageId(message) {
+    return message?.key?.id || message?.key?.remoteJid + ':' + Number(message?.messageTimestamp || 0);
+}
+
+function rememberBotMessage(sentMessage) {
+    const messageId = getMessageId(sentMessage);
+    if (messageId) {
+        rememberMessage(botMessageIds, messageId);
+    }
+}
+
+async function sendBotMessage(jid, content, options = {}) {
+    const sent = await sock.sendMessage(jid, content, options);
+    rememberBotMessage(sent);
+    return sent;
+}
+
+async function updateOrSendText(jid, text, editKey, options = {}) {
+    if (editKey) {
+        try {
+            await sock.sendMessage(jid, { text, edit: editKey });
+            return { key: editKey, edited: true };
+        } catch (error) {
+            console.warn('Message edit failed, sending a fresh fallback message:', error?.message || error);
+        }
+    }
+
+    const sent = await sendBotMessage(jid, { text }, options);
+    return { key: sent.key, edited: false };
+}
+
 async function startBot() {
     if (shuttingDown) {
-        console.log('🛑 Shutdown in progress, skipping bot start.');
+        console.log('Shutdown in progress, skipping bot start.');
         return;
     }
 
-    // 🔒 Prevent multiple concurrent reconnections (the #1 cause of Status 440 loops)
     if (isReconnecting) {
-        console.log('⏳ Reconnection already in progress, skipping duplicate...');
+        console.log('Reconnection already in progress, skipping duplicate...');
         return;
     }
     isReconnecting = true;
 
     try {
-        // Clean up old socket if it exists
         if (sock) {
             try {
                 sock.ev.removeAllListeners();
                 sock.ws?.close();
-            } catch (e) { /* ignore cleanup errors */ }
+            } catch (e) {}
             sock = null;
         }
         botReady = false;
@@ -64,7 +119,7 @@ async function startBot() {
         await fetchNvidiaModels();
         const { state, saveCreds } = await getAuthState();
         const { version, isLatest } = await fetchLatestBaileysVersion();
-        console.log(`📡 Using WA v${version.join('.')}, isLatest: ${isLatest}`);
+        console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
 
         sock = makeWASocket({
             version,
@@ -72,32 +127,25 @@ async function startBot() {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
-            printQRInTerminal: false, // we handle QR ourselves for better display
+            printQRInTerminal: false,
             logger,
             browser: ['Ubuntu', 'Chrome', '20.0.04'],
             generateHighQualityLinkPreview: false,
             syncFullHistory: false,
         });
 
-        // Connection events
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
                 globalQR = qr;
                 const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(qr);
-
-                console.log('\n\n\n');
-                console.log('╔════════════════════════════════════════════════════════════╗');
-                console.log('║                   🤖 WhBot AI — QR Login                   ║');
-                console.log('╠════════════════════════════════════════════════════════════╣');
-                console.log('║ 👇 CLICK THE SECURE LINK BELOW TO VIEW YOUR QR CODE 👇     ║');
-                console.log('╚════════════════════════════════════════════════════════════╝');
-                console.log('\n' + qrUrl + '\n\n');
+                console.log('\n\nWhBot AI - QR Login\n');
+                console.log(qrUrl + '\n');
             }
 
             if (connection === 'open') {
-                isReconnecting = false; // 🔓 Unlock — we're connected
+                isReconnecting = false;
                 reconnectAttempts = 0;
                 if (reconnectTimer) {
                     clearTimeout(reconnectTimer);
@@ -107,18 +155,8 @@ async function startBot() {
                 myJid = sock.user?.id;
                 botReady = true;
                 START_TIME = Math.floor(Date.now() / 1000);
-                console.log('╔══════════════════════════════════════╗');
-                console.log('║       ✅ WhBot AI — Connected!        ║');
-                console.log('╠══════════════════════════════════════╣');
-                console.log(`║  Logged in as: ${(sock.user?.name || 'Unknown').padEnd(20)} ║`);
-                console.log(`║  JID: ${(myJid || '').substring(0, 30).padEnd(30)} ║`);
-                console.log(`║  Command: ${PREFIX} <your prompt>`.padEnd(39) + '║');
-                console.log(`║  T1 (Daily): ${config.models.tier1[0].name}`.padEnd(39) + '║');
-                console.log(`║  T2 (Coding): ${config.models.tier2[0].name}`.padEnd(39) + '║');
-                console.log(`║  T3 (Council): ${config.models.tier3.length} Parallel Models`.padEnd(39) + '║');
-                console.log('╚══════════════════════════════════════╝');
-                console.log('');
-                console.log('🟢 Listening for messages...');
+                console.log(`Connected as ${sock.user?.name || 'Unknown'} (${myJid || ''})`);
+                console.log('Listening for messages...');
             }
 
             if (connection === 'close') {
@@ -131,10 +169,10 @@ async function startBot() {
                 const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.badSession;
 
-                console.log(`🔴 Disconnected. Status: ${statusCode}`);
+                console.log(`Disconnected. Status: ${statusCode}`);
 
                 if (shouldReconnect) {
-                    isReconnecting = false; // 🔓 Unlock so the next attempt can proceed
+                    isReconnecting = false;
                     reconnectAttempts += 1;
                     const baseDelay = statusCode === DisconnectReason.connectionReplaced || statusCode === 440 ? 15000 : 3000;
                     const cappedDelay = Math.min(baseDelay * (2 ** Math.min(reconnectAttempts - 1, 4)), 120000);
@@ -142,10 +180,10 @@ async function startBot() {
                     const delay = cappedDelay + jitter;
 
                     if (statusCode === DisconnectReason.connectionReplaced || statusCode === 440) {
-                        console.log('⚠️ Connection replaced detected (often duplicate instance/session).');
+                        console.log('Connection replaced detected (often duplicate instance/session).');
                     }
 
-                    console.log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts})...`);
+                    console.log(`Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts})...`);
                     if (reconnectTimer) clearTimeout(reconnectTimer);
                     reconnectTimer = setTimeout(() => {
                         reconnectTimer = null;
@@ -154,28 +192,34 @@ async function startBot() {
                 } else {
                     isReconnecting = false;
                     if (statusCode === DisconnectReason.badSession) {
-                        console.log('❌ Bad session detected. Clear auth state and login again.');
+                        console.log('Bad session detected. Clear auth state and login again.');
                     } else {
-                        console.log('❌ Logged out. Delete auth_info/ folder and restart to re-login.');
+                        console.log('Logged out. Delete auth_info/ folder and restart to re-login.');
                     }
                 }
             }
         });
 
-        // Save credentials on update
         sock.ev.on('creds.update', saveCreds);
 
-        // Message handler
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (!botReady) return;
             if (type !== 'notify') return;
 
             for (const msg of messages) {
+                const messageId = getMessageId(msg);
+                if (messageId && hasRecentMessage(botMessageIds, messageId)) {
+                    continue;
+                }
+                if (messageId && hasRecentMessage(processedMessages, messageId)) {
+                    continue;
+                }
+                rememberMessage(processedMessages, messageId);
                 await handleMessage(msg);
             }
         });
     } catch (err) {
-        console.error('❌ startBot error:', err.message);
+        console.error('startBot error:', err.message);
         isReconnecting = false;
         if (!shuttingDown) {
             reconnectAttempts += 1;
@@ -186,19 +230,17 @@ async function startBot() {
                 startBot();
             }, delay);
         }
-        return;
     }
 }
 
-/**
- * Handle incoming messages — only respond to own .ask commands
- */
 async function handleMessage(msg) {
     try {
-        // Only process messages from self
+        if (!msg?.message) return;
+
+        const incomingId = getMessageId(msg);
+        if (incomingId && hasRecentMessage(botMessageIds, incomingId)) return;
         if (!msg.key.fromMe) return;
 
-        // Ignore historical messages from sync (handle Long objects correctly)
         let msgTime = Number(msg.messageTimestamp);
         if (typeof msg.messageTimestamp === 'object') {
             if (typeof msg.messageTimestamp.toNumber === 'function') {
@@ -207,27 +249,26 @@ async function handleMessage(msg) {
                 msgTime = msg.messageTimestamp.low;
             }
         }
-        
-        // If somehow the timestamp is in milliseconds instead of seconds
+
         if (msgTime > 10000000000) {
             msgTime = Math.floor(msgTime / 1000);
         }
 
         if (msgTime < START_TIME) return;
 
-        // Get the text content
         const text = msg.message?.conversation
             || msg.message?.extendedTextMessage?.text
             || '';
 
-        // Handle Media & Documents
         const msgType = Object.keys(msg.message || {})[0];
-        const isImage = msgType === 'imageMessage' || msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage;
-        const isDoc = msgType === 'documentMessage' || msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.documentMessage;
+        const quotedMessage = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+        const isImage = msgType === 'imageMessage' || quotedMessage?.imageMessage;
+        const isDoc = msgType === 'documentMessage' || quotedMessage?.documentMessage;
+        const chatJid = msg.key.remoteJid;
 
         let imageBase64 = null;
         if (isImage) {
-            const mediaNode = msgType === 'imageMessage' ? msg : { ...msg, message: msg.message.extendedTextMessage.contextInfo.quotedMessage };
+            const mediaNode = msgType === 'imageMessage' ? msg : { ...msg, message: quotedMessage };
             try {
                 const buffer = await downloadMediaMessage(mediaNode, 'buffer', {}, { logger });
                 imageBase64 = buffer.toString('base64');
@@ -238,13 +279,13 @@ async function handleMessage(msg) {
 
         let pdfContext = '';
         if (isDoc) {
-            const mediaNode = msgType === 'documentMessage' ? msg : { ...msg, message: msg.message.extendedTextMessage.contextInfo.quotedMessage };
+            const mediaNode = msgType === 'documentMessage' ? msg : { ...msg, message: quotedMessage };
             if (mediaNode.message.documentMessage?.mimetype === 'application/pdf') {
                 try {
                     const buffer = await downloadMediaMessage(mediaNode, 'buffer', {}, { logger });
                     pdfContext = await parsePdfBuffer(buffer);
                     if (pdfContext) {
-                        pdfContext = `[Extracted PDF Content:\n${pdfContext.substring(0, 15000)}]\n\n`; // cap length to avoid overloading tokens
+                        pdfContext = `[Extracted PDF Content:\n${pdfContext.substring(0, 15000)}]\n\n`;
                     }
                 } catch (e) {
                     console.error('PDF Parse failed', e);
@@ -252,55 +293,50 @@ async function handleMessage(msg) {
             }
         }
 
-        // --- SPECIAL COMMAND ROUTING ---
-        // .help command
         if (text.trim() === '.help') {
-            const helpMenu = `*🤖 WhBot Council — Tool Suite*\n\n` +
-                `*Core Chat:*\n` +
-                `• \`.ask <msg>\` - Talk to the AI router\n` +
-                `• \`.ask "model" <msg>\` - Force a specific model\n` +
-                `• \`.council <msg>\` - Deploy the 9-Member AI Council\n` +
-                `• \`.model\` - List all available models\n\n` +
-                `*Tools:*\n` +
-                `• \`.search <query>\` - Perform a live Google search\n` +
-                `• \`.topdf <text>\` - Converts your text into a PDF file\n\n` +
-                `*Auto-Features:*\n` +
-                `• 🖼️ *Vision:* Send any image with a caption to analyze it via Llama-90B.\n` +
-                `• 📄 *PDF Reader:* Send any PDF file with a prompt to read it.\n` +
-                `• 💻 *Code Export:* Any large code output will automatically generate a Pastebin link for easy copying.`;
-            await sock.sendMessage(msg.key.remoteJid, { text: helpMenu });
+            const helpMenu = `*WhBot Council - Tool Suite*\n\n`
+                + `*Core Chat:*\n`
+                + `• \`.ask <msg>\` - Talk to the AI router\n`
+                + `• \`.ask "model" <msg>\` - Force a specific model\n`
+                + `• \`.council <msg>\` - Deploy the 9-Member AI Council\n`
+                + `• \`.model\` - List all available models\n\n`
+                + `*Tools:*\n`
+                + `• \`.search <query>\` - Perform a live Google search\n`
+                + `• \`.topdf <text>\` - Converts your text into a PDF file\n\n`
+                + `*Auto-Features:*\n`
+                + `• Vision: Send any image with a caption to analyze it via Llama-90B.\n`
+                + `• PDF Reader: Send any PDF file with a prompt to read it.\n`
+                + `• Code Export: Any large code output will automatically generate a Pastebin link for easy copying.`;
+            await sendBotMessage(chatJid, { text: helpMenu });
             return;
         }
 
-        // .topdf command
         if (text.startsWith('.topdf ')) {
             const pdfInput = text.substring(7);
-            await sock.sendMessage(msg.key.remoteJid, { text: `Processing PDF...` }, { quoted: msg });
+            await sendBotMessage(chatJid, { text: 'Processing PDF...' }, { quoted: msg });
             try {
                 const pBuffer = await createPdfBuffer(pdfInput);
-                await sock.sendMessage(msg.key.remoteJid, { 
-                    document: pBuffer, 
-                    mimetype: 'application/pdf', 
-                    fileName: 'WhBot_Generated.pdf' 
+                await sendBotMessage(chatJid, {
+                    document: pBuffer,
+                    mimetype: 'application/pdf',
+                    fileName: 'WhBot_Generated.pdf'
                 });
             } catch (e) {
-                await sock.sendMessage(msg.key.remoteJid, { text: `❌ PDF generation failed.` });
+                await sendBotMessage(chatJid, { text: 'PDF generation failed.' });
             }
             return;
         }
 
-        // .model command
         if (text.trim() === '.model') {
-            const availableModelsMsg = `*🤖 Available AI Models*\n\n` +
-                `*Quick Reference (Tiers):*\n` +
-                `• Tier 1: ${config.models.tier1.map(m => m.name).join(', ')}\n` +
-                `• Tier 2: ${config.models.tier2.map(m => m.name).join(', ')}\n` +
-                `• Tier 3 (Council): ${config.models.tier3.map(m => m.name).join(', ')}\n\n` +
-                `*All Available NVIDIA NIMs:*\n` +
-                (availableModels.length ? `\`\`\`${availableModels.join('\n')}\`\`\`` : '_(Loading...)_') + `\n\n` +
-                `_Use '.ask "model_name" your prompt' to force a specific model. You do not need to type the full name, just enough words to fuzzy match it!_`;
-
-            await sock.sendMessage(msg.key.remoteJid, { text: availableModelsMsg });
+            const availableModelsMsg = `*Available AI Models*\n\n`
+                + `*Quick Reference (Tiers):*\n`
+                + `• Tier 1: ${config.models.tier1.map(m => m.name).join(', ')}\n`
+                + `• Tier 2: ${config.models.tier2.map(m => m.name).join(', ')}\n`
+                + `• Tier 3 (Council): ${config.models.tier3.map(m => m.name).join(', ')}\n\n`
+                + `*All Available NVIDIA NIMs:*\n`
+                + (availableModels.length ? `\`\`\`${availableModels.join('\n')}\`\`\`` : '_(Loading...)_') + `\n\n`
+                + `_Use '.ask "model_name" your prompt' to force a specific model. You do not need to type the full name, just enough words to fuzzy match it!_`;
+            await sendBotMessage(chatJid, { text: availableModelsMsg });
             return;
         }
 
@@ -310,19 +346,18 @@ async function handleMessage(msg) {
         let requiresSearch = false;
         let isCouncil = false;
 
-        // Check for .search prefix
         if (text.startsWith('.search ')) {
             prompt = text.substring(8).trim();
             requiresSearch = true;
-        }
-        else if (text.startsWith('.council ') || text.trim() === '.council') {
-            prompt = text.startsWith('.council ') ? text.substring(9).trim() : '';
+        } else if (text.startsWith('.council ')) {
+            prompt = text.substring(9).trim();
             isCouncil = true;
-        }
-        // Check for .ask prefix
-        else if (text.startsWith(PREFIX + ' ') || text.startsWith(PREFIX + '"')) {
-            // Parse .ask "model name" prompt
-            const match = text.match(/^\.ask\s+"([^"]+)"\s+(.+)$/s);
+        } else if (text.trim() === '.council') {
+            await sendBotMessage(chatJid, { text: 'Please provide a prompt after .council.' }, { quoted: msg });
+            return;
+        } else if (text.startsWith(PREFIX + ' ') || text.startsWith(PREFIX + '"')) {
+            const escapedPrefix = PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const match = text.match(new RegExp(`^${escapedPrefix}\\s+"([^"]+)"\\s+(.+)$`, 's'));
             if (match) {
                 isSelect = true;
                 forcedModelName = match[1];
@@ -330,33 +365,22 @@ async function handleMessage(msg) {
             } else {
                 prompt = text.substring(PREFIX.length + 1).trim();
             }
-        } 
-        // If it's a captioned image/PDF but doesn't have .ask matching, allow it to process the text if there is text.
-        else if ((isImage || isDoc) && text.trim().length > 0) {
+        } else if ((isImage || isDoc) && text.trim().length > 0) {
             prompt = text.trim();
-        } else if (!isCouncil) {
+        } else {
             return;
         }
 
         if (!prompt && !isCouncil) return;
 
-        const chatJid = msg.key.remoteJid;
-
-        // Extract context if replying to a message
         const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
-        const quotedMessage = contextInfo?.quotedMessage;
-        let quotedText = '';
-        if (quotedMessage) {
-            // Find text in quoted message depending on its type
-            quotedText = quotedMessage.conversation || 
-                         quotedMessage.extendedTextMessage?.text || 
-                         quotedMessage.imageMessage?.caption || 
-                         quotedMessage.videoMessage?.caption || '';
-        }
+        const quotedText = contextInfo?.quotedMessage?.conversation
+            || contextInfo?.quotedMessage?.extendedTextMessage?.text
+            || contextInfo?.quotedMessage?.imageMessage?.caption
+            || contextInfo?.quotedMessage?.videoMessage?.caption
+            || '';
 
-        // Build the final prompt with context
         let fullPrompt = prompt;
-
         if (requiresSearch) {
             const searchRes = await googleSearch(prompt);
             fullPrompt = `[Live Web Search Context:\n${searchRes}]\n\nUser Query: ${prompt}`;
@@ -368,21 +392,19 @@ async function handleMessage(msg) {
             fullPrompt = pdfContext + fullPrompt;
         }
 
-        console.log(`\n📨 Prompt: "${fullPrompt.substring(0, 80)}${fullPrompt.length > 80 ? '...' : ''}"\n   Chat: ${chatJid}`);
+        console.log(`\nPrompt: "${fullPrompt.substring(0, 80)}${fullPrompt.length > 80 ? '...' : ''}"\nChat: ${chatJid}`);
 
-        // Get or initialize chat history for this user/group
         if (!chatHistories.has(chatJid)) {
             chatHistories.set(chatJid, []);
         }
         const history = chatHistories.get(chatJid);
 
-        // Select model(s) based on prompt complexity or override
         let modelConfigs = [];
         let isImageIntent = false;
 
         if (imageBase64) {
-             console.log(`👁️ Vision mode activated: Overriding router to Llama-3.2-90B-Vision`);
-             modelConfigs = [{ provider: 'nvidia', name: 'meta/llama-3.2-90b-vision-instruct', imageBase64: imageBase64 }];
+            console.log('Vision mode activated: Overriding router to Llama-3.2-90B-Vision');
+            modelConfigs = [{ provider: 'nvidia', name: 'meta/llama-3.2-90b-vision-instruct', imageBase64 }];
         } else if (isSelect) {
             if (forcedModelName.toLowerCase().includes('gemini') && forcedModelName.toLowerCase().includes('image')) {
                 isImageIntent = true;
@@ -392,21 +414,20 @@ async function handleMessage(msg) {
                 if (forcedModelName.toLowerCase().includes('pro')) gName = 'gemini-1.5-pro';
                 else if (forcedModelName.toLowerCase().includes('1.5-flash')) gName = 'gemini-1.5-flash';
                 else if (forcedModelName.toLowerCase().includes('2.0-flash')) gName = 'gemini-2.0-flash';
-                
                 modelConfigs = [{ provider: 'gemini', name: gName }];
             } else {
                 const matched = fuzzyMatchModel(forcedModelName);
                 if (matched) {
                     modelConfigs = [{ provider: 'nvidia', name: matched }];
                 } else {
-                    await sock.sendMessage(chatJid, { text: `❌ Could not find a model matching "${forcedModelName}".`});
+                    await sendBotMessage(chatJid, { text: `Could not find a model matching "${forcedModelName}".` });
                     return;
                 }
             }
         } else {
             isImageIntent = await analyzeIntent(fullPrompt);
             if (isImageIntent) {
-                console.log(`🎨 Image Generation Intent Detected: Routing to Gemini 2.5 Flash Image`);
+                console.log('Image Generation Intent Detected: Routing to Gemini 2.5 Flash Image');
                 modelConfigs = [{ provider: 'gemini_image', name: 'gemini-2.5-flash-image' }];
             } else {
                 modelConfigs = await selectModel(fullPrompt);
@@ -415,69 +436,69 @@ async function handleMessage(msg) {
 
         const isParallelCouncil = modelConfigs.length > 1;
 
-        async function postProcessAndSend(finalText, editKey) {
+        history.push({ role: 'user', parts: [{ text: fullPrompt }] });
+
+        const systemPrompt = `You are an expert AI council. ALWAYS format your output meticulously using WhatsApp markdown:
+- CRITICAL FORMATTING: NEVER output large blocks of text. ALWAYS break everything down into very short, bite-sized paragraphs separated by double line breaks.
+- MATHEMATICS: For ALL numerical or physics problems, solve them strictly LINE-BY-LINE. Use exact mathematical symbols (×, ÷, √, π, ∑, ∫, ≠, ≤, ≥, ², ³) and put EVERY individual step of the calculation on a brand new line. Do NOT combine multiple equation steps into a single paragraph.
+- Use *bold* for headings and extreme emphasis.
+- Use _italics_ for subheadings or subtle emphasis.
+- Use triple backticks for all code blocks or structured data tables.
+- Use single backticks for inline variables.
+- Use > for important conclusions or highlighted facts.
+- Use numbered (1., 2.) and bulleted (-) lists rigorously instead of large paragraphs.
+Avoid walls of text. Provide absolute maximum intelligence, logic, and structure. DO NOT introduce yourself or state your model name. Just answer.`;
+
+        const sentMsg = await sendBotMessage(chatJid, { text: 'Analyzing...' }, { quoted: msg });
+        let activeReplyKey = sentMsg.key;
+
+        const updateReplyText = async (textToSend) => {
+            const result = await updateOrSendText(chatJid, textToSend, activeReplyKey, { quoted: msg });
+            if (result?.key) {
+                activeReplyKey = result.key;
+            }
+        };
+
+        const postProcessAndSend = async (finalText) => {
             let finalOutput = finalText;
             const codeBlocks = [...finalOutput.matchAll(/```[\s\S]*?```/g)].map(m => m[0]);
             if (codeBlocks.length > 0) {
-                 const largestBlock = codeBlocks.reduce((a, b) => a.length > b.length ? a : b);
-                 const cleanCode = largestBlock.replace(/^```[a-zA-Z_-]*\n?/g, '').replace(/```$/g, '').trim();
-                 if (cleanCode.length > 50) {
-                     try {
-                         const url = await uploadToPastebin(cleanCode);
-                         if (url) finalOutput += `\n\n🔗 *Copy Code safely:* ${url}`;
-                     } catch(err) { console.error("Pastebin upload failed"); }
-                 }
+                const largestBlock = codeBlocks.reduce((a, b) => a.length > b.length ? a : b);
+                const cleanCode = largestBlock.replace(/^```[a-zA-Z_-]*\n?/g, '').replace(/```$/g, '').trim();
+                if (cleanCode.length > 50) {
+                    try {
+                        const url = await uploadToPastebin(cleanCode);
+                        if (url) finalOutput += `\n\nLink: *Copy Code safely:* ${url}`;
+                    } catch (err) {
+                        console.error('Pastebin upload failed', err?.message || err);
+                    }
+                }
             }
-            await sock.sendMessage(chatJid, { text: finalOutput, edit: editKey });
-        }
-
-        const systemPrompt = `You are an expert AI council. ALWAYS format your output meticulously using WhatsApp markdown:
-- *CRITICAL FORMATTING*: NEVER output large blocks of text. ALWAYS break everything down into very short, bite-sized paragraphs separated by double line breaks.
-- *MATHEMATICS*: For ALL numerical or physics problems, solve them strictly LINE-BY-LINE. Use exact mathematical symbols (×, ÷, √, π, ∑, ∫, ≠, ≤, ≥, ², ³) and put EVERY individual step of the calculation on a brand new line. Do NOT combine multiple equation steps into a single paragraph.
-- Use *bold* for headings and extreme emphasis.
-- Use _italics_ for subheadings or subtle emphasis.
-- Use \`\`\` (triple backticks) for all code blocks or structured data tables.
-- Use \` (single backtick) for inline variables.
-- Use > (blockquote) for important conclusions or highlighted facts.
-- Use numbered (1., 2.) and bulleted (-) lists rigorously instead of large paragraphs.
-- Weave relevant emojis gracefully but professionally to anchor visual sections.
-Avoid walls of text. Provide absolute maximum intelligence, logic, and structure. DO NOT introduce yourself or state your model name. Just answer.`;
-
-        // Push user message to history once before generating
-        history.push({ role: 'user', parts: [{ text: fullPrompt }] });
-
-        // ONE unified message for the frontend
-        const sentMsg = await sock.sendMessage(chatJid, { text: `💭 _Analyzing..._` }, { quoted: msg });
+            await updateReplyText(finalOutput);
+        };
 
         if (isCouncil) {
             try {
                 const result = await runCouncil(fullPrompt, imageBase64, async (statusMsg) => {
-                    try {
-                        await sock.sendMessage(chatJid, { text: statusMsg, edit: sentMsg.key });
-                    } catch (e) {} // Ignore fast edit limit errors
+                    await updateReplyText(statusMsg);
                 });
-                
                 history.push({ role: 'model', parts: [{ text: result.text }] });
-                await postProcessAndSend(result.text, sentMsg.key);
+                await postProcessAndSend(result.text);
             } catch (error) {
                 console.error('Council error:', error);
-                await sock.sendMessage(chatJid, { 
-                    text: `❌ _Council Execution Failed:_\n\n${error.message}`, 
-                    edit: sentMsg.key 
-                });
+                await updateReplyText(`Council Execution Failed:\n\n${error.message}`);
             }
-            return; // Done
+            return;
         }
 
         if (isImageIntent) {
-            await sock.sendMessage(chatJid, { text: `🎨 _Generating your image..._` }, { edit: sentMsg.key });
-            
+            await updateReplyText('Generating your image...');
             try {
-                const response = await fetch("https://image-gen.merajrabbani-4870.workers.dev/", {
-                    method: "POST",
+                const response = await fetch('https://image-gen.merajrabbani-4870.workers.dev/', {
+                    method: 'POST',
                     headers: {
-                        "Authorization": "Bearer imagenmeraj",
-                        "Content-Type": "application/json"
+                        Authorization: 'Bearer imagenmeraj',
+                        'Content-Type': 'application/json'
                     },
                     body: JSON.stringify({ prompt: fullPrompt })
                 });
@@ -488,55 +509,46 @@ Avoid walls of text. Provide absolute maximum intelligence, logic, and structure
 
                 const arrayBuffer = await response.arrayBuffer();
                 const buffer = Buffer.from(arrayBuffer);
-
-                await sock.sendMessage(chatJid, { 
-                    image: buffer, 
-                    caption: `🎨 *Generated by Cloudflare*` 
+                await sendBotMessage(chatJid, {
+                    image: buffer,
+                    caption: 'Generated by Cloudflare'
                 }, { quoted: msg });
 
-                await sock.sendMessage(chatJid, { delete: sentMsg.key });
+                try {
+                    await sock.sendMessage(chatJid, { delete: activeReplyKey });
+                } catch (deleteErr) {
+                    console.warn('Failed to delete progress message:', deleteErr?.message || deleteErr);
+                }
             } catch (error) {
-                console.error("Cloudflare Image Error:", error);
-                await sock.sendMessage(chatJid, { text: `❌ _Failed to generate image:_\n\n${error.message}` }, { edit: sentMsg.key });
+                console.error('Cloudflare Image Error:', error);
+                await updateReplyText(`Failed to generate image:\n\n${error.message}`);
             }
             return;
         }
 
         if (isParallelCouncil) {
-            // DRAFT + BACKGROUND PATTERN
-            // 1. Run Draft (Gemini) immediately into the UI
             try {
                 const draftStream = streamGenerate(fullPrompt, 'gemini-2.5-flash', systemPrompt, history.slice(0, -1));
                 let draftAccumulated = '';
                 let lastEditTime = 0;
                 let chunkBuffer = '';
-                
+
                 for await (const chunk of draftStream) {
                     draftAccumulated += chunk;
                     chunkBuffer += chunk;
                     const now = Date.now();
-                    
                     if (now - lastEditTime >= EDIT_INTERVAL && chunkBuffer.length >= MIN_CHUNK) {
-                        try {
-                            await sock.sendMessage(chatJid, {
-                                text: streamingIndicator(formatForWhatsApp(draftAccumulated)),
-                                edit: sentMsg.key
-                            });
-                            lastEditTime = now;
-                            chunkBuffer = '';
-                        } catch (e) {}
+                        await updateReplyText(streamingIndicator(formatForWhatsApp(draftAccumulated)));
+                        lastEditTime = now;
+                        chunkBuffer = '';
                     }
                 }
-                // Leave draft intact while waiting for heavy models, appending warning
-                await sock.sendMessage(chatJid, {
-                    text: formatForWhatsApp(draftAccumulated) + `\n\n> ⏳ _Draft response complete. The Heavy Council is computing a deep answer in the background..._`,
-                    edit: sentMsg.key
-                });
+
+                await updateReplyText(formatForWhatsApp(draftAccumulated) + '\n\n> Draft response complete. The Heavy Council is computing a deep answer in the background...');
             } catch (e) {
-                console.error("Draft failed, skipping to background execution.");
+                console.error('Draft failed, skipping to background execution.', e?.message || e);
             }
 
-            // 2. Run Heavy Models silently in background
             const bgTasks = modelConfigs.map(async (modelConfig) => {
                 const { name: modelName, provider, imageBase64: img64 } = modelConfig;
                 let bgAccumulated = '';
@@ -546,7 +558,7 @@ Avoid walls of text. Provide absolute maximum intelligence, logic, and structure
                         : streamGenerate(fullPrompt, modelName, systemPrompt, history.slice(0, -1));
 
                     for await (const chunk of stream) {
-                        bgAccumulated += chunk; // No networking overhead, purely backgrounding
+                        bgAccumulated += chunk;
                     }
                     return { modelName, accumulated: bgAccumulated };
                 } catch (err) {
@@ -555,25 +567,18 @@ Avoid walls of text. Provide absolute maximum intelligence, logic, and structure
             });
 
             const results = await Promise.all(bgTasks);
-            
-            // 3. Reveal final massive answer (replace draft)
-            const combinedOutput = results.map((r, idx) => `> *Council Node ${idx+1} Analysis:*\n${r.accumulated}`).join('\n\n');
+            const combinedOutput = results.map((r, idx) => `> *Council Node ${idx + 1} Analysis:*\n${r.accumulated}`).join('\n\n');
             const finalText = finalFormat(combinedOutput, 'Council');
-            
-            await postProcessAndSend(finalText, sentMsg.key);
-
-            console.log(`✅ Parallel Council execution complete. Replaced draft.`);
-
+            await postProcessAndSend(finalText);
+            console.log('Parallel Council execution complete. Replaced draft.');
             history.push({ role: 'model', parts: [{ text: combinedOutput }] });
-
         } else {
-            // STANDARD SINGLE EXECUTION
             const modelConfig = modelConfigs[0];
             const { name: modelName, provider, imageBase64: img64 } = modelConfig;
             let accumulated = '';
             let lastEditTime = 0;
             let chunkBuffer = '';
-            
+
             try {
                 const stream = provider === 'nvidia'
                     ? streamGenerateNvidia(fullPrompt, modelName, systemPrompt, history.slice(0, -1), img64)
@@ -582,65 +587,48 @@ Avoid walls of text. Provide absolute maximum intelligence, logic, and structure
                 for await (const chunk of stream) {
                     accumulated += chunk;
                     chunkBuffer += chunk;
-
                     const now = Date.now();
                     const timeSinceLastEdit = now - lastEditTime;
 
                     if (timeSinceLastEdit >= EDIT_INTERVAL && chunkBuffer.length >= MIN_CHUNK) {
-                        try {
-                            await sock.sendMessage(chatJid, {
-                                text: streamingIndicator(formatForWhatsApp(accumulated)),
-                                edit: sentMsg.key
-                            });
-                            lastEditTime = now;
-                            chunkBuffer = '';
-                        } catch (editErr) {}
+                        await updateReplyText(streamingIndicator(formatForWhatsApp(accumulated)));
+                        lastEditTime = now;
+                        chunkBuffer = '';
                     }
                 }
 
-                // Final edit WITHOUT model name
                 const finalText = finalFormat(accumulated, modelName);
-                await postProcessAndSend(finalText, sentMsg.key);
-
-                console.log(`✅ Response sent (${accumulated.length} chars) via ${modelName}`);
-
+                await postProcessAndSend(finalText);
+                console.log(`Response sent (${accumulated.length} chars) via ${modelName}`);
                 history.push({ role: 'model', parts: [{ text: accumulated }] });
-
             } catch (error) {
-                console.error(`❌ Stream error from ${modelName}:`, error.message);
-                const errorMsg = accumulated 
-                    ? finalFormat(accumulated, modelName) + `\n\n*(Error generating the rest)*`
-                    : `❌ _Error: Failed to fetch response_`;
-
-                await sock.sendMessage(chatJid, {
-                    text: errorMsg,
-                    edit: sentMsg.key
-                });
+                console.error(`Stream error from ${modelName}:`, error.message);
+                const errorMsg = accumulated
+                    ? finalFormat(accumulated, modelName) + '\n\n*(Error generating the rest)*'
+                    : 'Error: Failed to fetch response';
+                await updateReplyText(errorMsg);
                 history.push({ role: 'model', parts: [{ text: accumulated || 'Error' }] });
             }
         }
 
-        // Prune history if it exceeds the limit
         if (history.length > MAX_HISTORY_LENGTH) {
             const excess = history.length - MAX_HISTORY_LENGTH;
             history.splice(0, excess);
         }
-
     } catch (error) {
-        console.error('❌ Handler error:', error);
+        console.error('Handler error:', error);
     }
 }
 
-// Global error handlers to prevent Baileys internal crashes (e.g., libsignal decryption failures)
 process.on('unhandledRejection', (err) => {
-    console.error('⚠️ Unhandled Promise Rejection (Likely Baileys Internal):', err.message || err);
+    console.error('Unhandled Promise Rejection (Likely Baileys Internal):', err.message || err);
 });
 process.on('uncaughtException', (err) => {
-    console.error('⚠️ Uncaught Exception:', err.message || err);
+    console.error('Uncaught Exception:', err.message || err);
 });
 
 function gracefulShutdown(signal) {
-    console.log(`🛑 Received ${signal}. Shutting down gracefully...`);
+    console.log(`Received ${signal}. Shutting down gracefully...`);
     shuttingDown = true;
     botReady = false;
     isReconnecting = false;
@@ -658,7 +646,6 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Start Express Server for Render health checks and UptimeRobot pinging
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -667,24 +654,23 @@ app.get('/', (req, res) => {
         const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?data=' + encodeURIComponent(globalQR) + '&size=300x300';
         res.send(`
             <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
-                <h2>📱 Scan to Login to WhBot</h2>
+                <h2>Scan to Login to WhBot</h2>
                 <img src="${qrUrl}" alt="WhatsApp QR Code" style="border: 1px solid #ccc; padding: 10px; border-radius: 10px;" />
                 <p style="color: #666; margin-top: 20px;">Refresh this page if the QR code expires.</p>
             </div>
         `);
     } else if (globalQR === 'connected') {
-        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px; color: green;">✅ WhBot is Connected and Running!</h2>');
+        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px; color: green;">WhBot is Connected and Running!</h2>');
     } else {
-        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px;">🤖 WhBot is starting, please wait...</h2>');
+        res.send('<h2 style="font-family: sans-serif; text-align: center; margin-top: 50px;">WhBot is starting, please wait...</h2>');
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🌐 Web UI server running on port ${PORT}`);
+    console.log(`Web UI server running on port ${PORT}`);
 });
 
-// Start WhatsApp Bot
-console.log('🚀 Starting WhBot AI...');
+console.log('Starting WhBot AI...');
 startBot().catch(err => {
     console.error('Fatal error:', err);
     process.exit(1);
