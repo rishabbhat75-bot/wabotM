@@ -27,6 +27,9 @@ let START_TIME = Math.floor(Date.now() / 1000);
 let botReady = false;
 let globalQR = null;
 let isReconnecting = false; // 🔒 Prevent concurrent reconnection storms
+let shuttingDown = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
 
 let sock;
 let myJid = null; // will be set after connection
@@ -35,6 +38,11 @@ let myJid = null; // will be set after connection
  * Start the WhatsApp bot
  */
 async function startBot() {
+    if (shuttingDown) {
+        console.log('🛑 Shutdown in progress, skipping bot start.');
+        return;
+    }
+
     // 🔒 Prevent multiple concurrent reconnections (the #1 cause of Status 440 loops)
     if (isReconnecting) {
         console.log('⏳ Reconnection already in progress, skipping duplicate...');
@@ -90,6 +98,11 @@ async function startBot() {
 
             if (connection === 'open') {
                 isReconnecting = false; // 🔓 Unlock — we're connected
+                reconnectAttempts = 0;
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
                 globalQR = 'connected';
                 myJid = sock.user?.id;
                 botReady = true;
@@ -110,19 +123,41 @@ async function startBot() {
 
             if (connection === 'close') {
                 botReady = false;
+                if (shuttingDown) {
+                    isReconnecting = false;
+                    return;
+                }
+
                 const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== DisconnectReason.badSession;
 
                 console.log(`🔴 Disconnected. Status: ${statusCode}`);
 
                 if (shouldReconnect) {
                     isReconnecting = false; // 🔓 Unlock so the next attempt can proceed
-                    const delay = statusCode === 440 ? 8000 : 3000; // Wait longer on 440 to let WA cool down
-                    console.log(`🔄 Reconnecting in ${delay / 1000}s...`);
-                    setTimeout(startBot, delay);
+                    reconnectAttempts += 1;
+                    const baseDelay = statusCode === DisconnectReason.connectionReplaced || statusCode === 440 ? 15000 : 3000;
+                    const cappedDelay = Math.min(baseDelay * (2 ** Math.min(reconnectAttempts - 1, 4)), 120000);
+                    const jitter = Math.floor(Math.random() * 2000);
+                    const delay = cappedDelay + jitter;
+
+                    if (statusCode === DisconnectReason.connectionReplaced || statusCode === 440) {
+                        console.log('⚠️ Connection replaced detected (often duplicate instance/session).');
+                    }
+
+                    console.log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts})...`);
+                    if (reconnectTimer) clearTimeout(reconnectTimer);
+                    reconnectTimer = setTimeout(() => {
+                        reconnectTimer = null;
+                        startBot();
+                    }, delay);
                 } else {
                     isReconnecting = false;
-                    console.log('❌ Logged out. Delete auth_info/ folder and restart to re-login.');
+                    if (statusCode === DisconnectReason.badSession) {
+                        console.log('❌ Bad session detected. Clear auth state and login again.');
+                    } else {
+                        console.log('❌ Logged out. Delete auth_info/ folder and restart to re-login.');
+                    }
                 }
             }
         });
@@ -142,7 +177,15 @@ async function startBot() {
     } catch (err) {
         console.error('❌ startBot error:', err.message);
         isReconnecting = false;
-        setTimeout(startBot, 5000);
+        if (!shuttingDown) {
+            reconnectAttempts += 1;
+            const delay = Math.min(5000 * (2 ** Math.min(reconnectAttempts - 1, 4)), 120000);
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                startBot();
+            }, delay);
+        }
         return;
     }
 }
@@ -595,6 +638,25 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
     console.error('⚠️ Uncaught Exception:', err.message || err);
 });
+
+function gracefulShutdown(signal) {
+    console.log(`🛑 Received ${signal}. Shutting down gracefully...`);
+    shuttingDown = true;
+    botReady = false;
+    isReconnecting = false;
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    try {
+        sock?.ev?.removeAllListeners();
+        sock?.ws?.close();
+    } catch (e) {}
+    setTimeout(() => process.exit(0), 250);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Start Express Server for Render health checks and UptimeRobot pinging
 const app = express();
